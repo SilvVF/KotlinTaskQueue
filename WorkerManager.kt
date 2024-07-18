@@ -81,7 +81,7 @@ object WorkerManager {
     private val activeJobs = ConcurrentHashMap<UUID, Job>()
 
     private val queue = MutableStateFlow<List<WorkJob>>(emptyList())
-    private val completed = MutableStateFlow<List<WorkJob>>(emptyList())
+    val completed = MutableStateFlow<List<WorkJob>>(emptyList())
 
     val running = queue.map { jobs ->
         jobs.filter { it.state == Working || it.state == Queued }
