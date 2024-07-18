@@ -164,7 +164,7 @@ object WorkerManager {
                         activeJobs[job.id]?.join()
                     }
                 }
-                val requeue = jobs
+                val requeue = queued
                     .filterNot { job -> job.state == Completed || job.state == Cancelled }
                     .map {
                         it.copy(
@@ -177,7 +177,7 @@ object WorkerManager {
                     }
 
                 completed.update { complete ->
-                    complete + jobs.filter { job -> job.state == Completed || job.state == Cancelled }
+                    complete + queued.filter { job -> job.state == Completed || job.state == Cancelled }
                 }
 
                queue.update { requeue }
