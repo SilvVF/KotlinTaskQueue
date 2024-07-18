@@ -10,6 +10,10 @@ val jobId = WorkerManager.enqueue {
 //observe running and queued
 WorkerManager.running.collect()
 ```
+### Completed
+```kotlin
+WorkerManager.completed.collect { completedJobs -> ... } 
+```
 ### Cancel 
 ```kotlin
 // cancel work by UUID
