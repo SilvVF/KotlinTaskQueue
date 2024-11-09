@@ -1,187 +1,256 @@
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.filterNot
-import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.onEach
-import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.transformLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
-import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.cancellation.CancellationException
 
-data class Req(
-    val context: CoroutineContext = Dispatchers.Default,
-    val maxRetry: Int = 3,
-    val work: Worker,
-)
-
-data class WorkJob(
-    val id: UUID = UUID.randomUUID(),
-    val req: Req,
-    internal val _progress: MutableStateFlow<Float> = MutableStateFlow(0.0f),
-    internal val _state: MutableStateFlow<JobState> = MutableStateFlow(Idle),
-    val retry: Int = 0
-) {
-
-    val state: JobState
-        get() = _state.value
-
-    val progress: Float
-        get() = _progress.value
-
-    enum class JobState {
-        Idle,
-        Queued,
-        Completed,
-        Working,
-        Failed,
-        Cancelled
-    }
-}
-
-interface WorkContext {
-    val retry: Int
-    fun update(value: Float)
+interface Notifier {
+    fun onWarning(reason: String?)
+    fun onError(message: String?)
+    fun onComplete()
+    fun onPaused()
+    fun dismissProgress()
 
     companion object {
-        fun createCtx(job: WorkJob): WorkContext {
-            return  object : WorkContext {
-                override val retry: Int
-                    get() = job.retry
-
-                override fun update(value: Float) {
-                    job._progress.update { value }
-                }
-            }
+        val NoOpNotifier = object: Notifier {
+            override fun dismissProgress() = Unit
+            override fun onWarning(reason: String?) = Unit
+            override fun onError(message: String?) = Unit
+            override fun onComplete() = Unit
+            override fun onPaused() = Unit
         }
     }
 }
 
-fun interface Worker {
 
-    context(WorkContext)
-    suspend fun doWork()
-}
+@ExperimentalCoroutinesApi
+class SusQueue <T, K> (
+    val keySelector: (T) -> K,
+    val doWork: suspend (T) -> Result<Unit>,
+    private val parallel: Int = 3,
+    private val workScope: CoroutineScope = CoroutineScope(Dispatchers.IO),
+    private val notifier: Notifier = Notifier.NoOpNotifier,
+    private val initialItems: List<T> = emptyList()
+): Notifier by notifier {
 
-object WorkerManager {
+    data class Item<T>(
+        val data: T,
+    ) {
+        @Transient
+        private val _statusFlow = MutableStateFlow(State.IDLE)
 
-    private val mutex = Mutex()
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-    private val activeJobs = ConcurrentHashMap<UUID, Job>()
-
-    private val queue = MutableStateFlow<List<WorkJob>>(emptyList())
-    val completed = MutableStateFlow<List<WorkJob>>(emptyList())
-
-    val running = queue.map { jobs ->
-        jobs.filter { it.state == Working || it.state == Queued }
-    }
-        .stateIn(
-            scope,
-            SharingStarted.Lazily,
-            emptyList()
-        )
-
-    fun enqueue(worker: Worker): UUID {
-        val job = WorkJob(req = Req(work = worker))
-        queue.update { jobs ->
-            buildList {
-                addAll(jobs)
-                add(job)
+        @Transient
+        val statusFlow = _statusFlow.asStateFlow()
+        var status: State
+            get() = _statusFlow.value
+            set(status) {
+                _statusFlow.value = status
             }
+
+
+        enum class State(val value: Int) {
+            IDLE(0),
+            QUEUE(1),
+            RUNNING(2),
+            COMPLETED(3),
+            ERROR(4),
         }
-        return job.id
+
     }
 
-    fun enqueue(req: Req): UUID {
-        val job = WorkJob(req = req)
-        queue.update { jobs ->
-            buildList {
-                addAll(jobs)
-                add(job)
-            }
-        }
-        return job.id
-    }
-
-    fun cancel(id: UUID) {
-        val job = queue.value.find { it.id == id }
-        if (job != null) {
-            activeJobs[job.id]?.cancel()
-            job._state.value = Cancelled
-        }
-    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     init {
-        queue.asStateFlow()
-            .filterNot { it.isEmpty() }
-            .onEach { jobs ->
-                val queued = mutex.withLock {
-                   jobs
-                        .filter { job -> job.retry <= job.req.maxRetry }
-                        .filter { job -> job.state == Idle || job.state == Failed }
-                        .onEach { job ->
-                            job._state.value = Queued
-                        }
+        scope.launch {
+            addAllToQueue(initialItems)
+        }
+    }
+
+    private val _queueState = MutableStateFlow<List<Item<T>>>(emptyList())
+    val queueState = _queueState.asStateFlow()
+
+    private var queueJob: Job? = null
+
+    val isRunning: Boolean
+        get() = queueJob?.isActive ?: false
+
+
+    private fun areAllJobsFinished(): Boolean {
+        return queueState.value.none { it.status.value <= Item.State.RUNNING.value }
+    }
+
+
+    private fun cancelQueueJob() {
+        queueJob?.cancel()
+        queueJob = null
+    }
+
+    fun stop(reason: String? = null) {
+        cancelQueueJob()
+        queueState.value
+            .filter { it.status == Item.State.RUNNING }
+            .forEach { it.status = Item.State.ERROR }
+
+        if (reason != null) {
+            onWarning(reason)
+            return
+        }
+
+        if (queueState.value.isNotEmpty()) {
+            onPaused()
+        } else {
+            onComplete()
+        }
+    }
+
+
+    fun pause() {
+        cancelQueueJob()
+        queueState.value
+            .filter { it.status == Item.State.RUNNING }
+            .forEach { it.status = Item.State.QUEUE }
+    }
+
+    private fun internalClearQueue() {
+        _queueState.update {
+            it.forEach { item ->
+                if (item.status == Item.State.RUNNING ||
+                    item.status == Item.State.QUEUE
+                ) {
+                    item.status = Item.State.IDLE
+                }
+            }
+            emptyList()
+        }
+    }
+
+    fun clearQueue() {
+        cancelQueueJob()
+        internalClearQueue()
+        dismissProgress()
+    }
+
+    private fun addAllToQueue(items: List<T>) {
+        _queueState.update {
+            val queueItems = items.map { item ->
+                Item(data = item).apply {
+                    status = Item.State.QUEUE
+                }
+            }
+            it + queueItems
+        }
+    }
+
+    private fun removeFromQueueIf(predicate: (T) -> Boolean) {
+        _queueState.update { queue ->
+            val items = queue.filter { predicate(it.data) }
+            items.forEach { item ->
+                if (item.status == Item.State.RUNNING ||
+                    item.status == Item.State.QUEUE
+                ) {
+                    item.status = Item.State.IDLE
+                }
+            }
+            queue - items.toSet()
+        }
+    }
+
+    private fun areAllItemsFinished(): Boolean {
+        return queueState.value.none { it.status.value <= Item.State.RUNNING.value }
+    }
+
+    fun start(): Boolean {
+        if (isRunning || queueState.value.isEmpty()) {
+            return false
+        }
+
+        val pending = queueState.value.filter { it.status != Item.State.COMPLETED }
+        pending.forEach { if (it.status != Item.State.QUEUE) it.status = Item.State.QUEUE }
+
+        launchQueueJob()
+
+        return pending.isNotEmpty()
+    }
+
+    private fun removeFromQueue(item: Item<T>) {
+        _queueState.update {
+            if (item.status == Item.State.RUNNING || item.status == Item.State.QUEUE) {
+                item.status = Item.State.COMPLETED
+            }
+            it - item
+        }
+    }
+
+    private fun launchQueueJob() {
+        if (isRunning) return
+
+        queueJob = scope.launch {
+            val activeJobsFlow = queueState.transformLatest { queue ->
+                while (true) {
+                    val activeJobs = queue.asSequence()
+                        .filter {
+                            it.status.value <= Item.State.RUNNING.value
+                        } // Ignore completed items, leave them in the queue
+                        .groupBy(keySelector = { keySelector(it.data) })
+                        .toList()
+                        .take(parallel)
+                        .map { (_, items) -> items.first() }
+                    emit(activeJobs)
+
+                    if (activeJobs.isEmpty()) break
+
+                    // Suspend until an item enters the ERROR state
+                    val activeJobsErroredFlow =
+                        combine(activeJobs.map(Item<T>::statusFlow)) { states ->
+                            states.contains(Item.State.ERROR)
+                        }.filter { it }
+                    activeJobsErroredFlow.first()
                 }
 
-                supervisorScope {
-                    for (job in queued) {
+                if (areAllJobsFinished()) stop()
+            }.distinctUntilChanged()
 
-                        if (job._state.value == Cancelled) continue
+            supervisorScope {
+                val queueJobs = mutableMapOf<Item<T>, Job>()
 
-                        job._state.value = Working
-                        job._progress.value = 0.0f
+                activeJobsFlow.collectLatest { activeJobs ->
+                    val jobsToStop = queueJobs.filter { it. key !in activeJobs}
+                    jobsToStop.forEach { (item, job) ->
+                        job.cancel()
+                        queueJobs.remove(item)
+                    }
 
-                        activeJobs[job.id] = launch(job.req.context) {
-                            val res = runCatching {
-                                with(WorkContext.createCtx(job)) {
-                                    job.req.work.doWork()
+                    val itemsToStart = activeJobs.filter { it !in queueJobs }
+                    itemsToStart.forEach { item ->
+                        queueJobs[item] = workScope.launch {
+                            try {
+                                val result = doWork(item.data)
+                                if (result.isSuccess) {
+                                    removeFromQueue(item)
+                                }
+                            } catch (e: Throwable) {
+                                if (e is CancellationException) {
+                                    onError("Item cancelled")
+                                } else {
+                                    notifier.onError(e.message)
                                 }
                             }
-                            job._state.value = res.fold(
-                                onFailure = { t ->
-                                    when(t) {
-                                        is CancellationException ->  Cancelled
-                                        else -> Failed
-                                    }
-                                },
-                                onSuccess = { Completed }
-                            )
-                            activeJobs.remove(job.id)
                         }
-
-                        activeJobs[job.id]?.join()
                     }
                 }
-                val requeue = queued
-                    .filterNot { job -> job.state == Completed || job.state == Cancelled }
-                    .map {
-                        it.copy(
-                            retry = it.retry + 1,
-                            id = it.id,
-                            req = it.req,
-                            _progress = it._progress,
-                            _state = it._state,
-                        )
-                    }
-
-                completed.update { complete ->
-                    complete + queued.filter { job -> job.state == Completed || job.state == Cancelled }
-                }
-
-               queue.update { requeue }
             }
-            .launchIn(scope)
+        }
     }
 }
