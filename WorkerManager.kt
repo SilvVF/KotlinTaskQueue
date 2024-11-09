@@ -1,3 +1,5 @@
+package ios.silv.myapplication.ui
+
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -47,6 +49,7 @@ class SusQueue <T, K> (
 
     data class Item<T>(
         val data: T,
+        val retryCount: Int
     ) {
         @Transient
         private val _statusFlow = MutableStateFlow(State.IDLE)
@@ -67,14 +70,13 @@ class SusQueue <T, K> (
             COMPLETED(3),
             ERROR(4),
         }
-
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     init {
         scope.launch {
-            addAllToQueue(initialItems)
+            addAllToQueue(initialItems, 0)
         }
     }
 
@@ -142,10 +144,10 @@ class SusQueue <T, K> (
         dismissProgress()
     }
 
-    private fun addAllToQueue(items: List<T>) {
+    private fun addAllToQueue(items: List<T>, retryCount: Int) {
         _queueState.update {
             val queueItems = items.map { item ->
-                Item(data = item).apply {
+                Item(data = item, retryCount).apply {
                     status = Item.State.QUEUE
                 }
             }
@@ -160,7 +162,7 @@ class SusQueue <T, K> (
                 if (item.status == Item.State.RUNNING ||
                     item.status == Item.State.QUEUE
                 ) {
-                    item.status = Item.State.IDLE
+                    item.status = Item.State.COMPLETED
                 }
             }
             queue - items.toSet()
@@ -191,6 +193,23 @@ class SusQueue <T, K> (
             }
             it - item
         }
+    }
+
+    private suspend fun <T> retry(retries: Int, predicate: suspend (attempt: Int) -> Result<T>): Result<T> {
+        require(retries > 0) { "Expected positive amount of retries, but had $retries" }
+        var throwable: Throwable? = null
+        (1..retries).forEach { attempt ->
+            try {
+                val result = predicate(attempt)
+                if (result.isSuccess) {
+                    return result
+                }
+                throwable = result.exceptionOrNull()
+            } catch (e: Throwable) {
+                throwable = e
+            }
+        }
+        return Result.failure(throwable ?: IllegalStateException())
     }
 
     private fun launchQueueJob() {
@@ -226,7 +245,7 @@ class SusQueue <T, K> (
                 val queueJobs = mutableMapOf<Item<T>, Job>()
 
                 activeJobsFlow.collectLatest { activeJobs ->
-                    val jobsToStop = queueJobs.filter { it. key !in activeJobs}
+                    val jobsToStop = queueJobs.filter { it. key !in activeJobs }
                     jobsToStop.forEach { (item, job) ->
                         job.cancel()
                         queueJobs.remove(item)
@@ -236,9 +255,14 @@ class SusQueue <T, K> (
                     itemsToStart.forEach { item ->
                         queueJobs[item] = workScope.launch {
                             try {
-                                val result = doWork(item.data)
+                                val result = retry(item.retryCount + 1) {
+                                    doWork(item.data)
+                                }
                                 if (result.isSuccess) {
+                                    item.status = Item.State.COMPLETED
                                     removeFromQueue(item)
+                                } else {
+                                    item.status = Item.State.ERROR
                                 }
                             } catch (e: Throwable) {
                                 if (e is CancellationException) {
